@@ -88,6 +88,8 @@ def get_options_data(ticker, risk_free_rate):
     options_df.rename(columns={"contractSymbol": "symbol"}, inplace=True)
     options_df['Volatility_y'] = stock_data['Volatility_y'].mean()
     options_df['quote_date'] = pd.Timestamp.today().normalize()
+    options_df = merge_historical_volatility(options_df, ticker)
+
     
     options_df[['delta', 'gamma', 'theta', 'rho', 'vega']] = options_df.apply(
         lambda row: compute_greeks(stock_price, row["strike"], row["time_to_expiration"], risk_free_rate, row['Volatility_y']), 
@@ -223,16 +225,106 @@ def get_filtered_sorted_options(options_df, min_profit=PROFIT_THRESHOLD, max_pri
 
     return sorted_filtered_options
 
+def compute_volatility_features(options_df, ticker):
+    today = datetime.today()
+    one_year_ago = today - timedelta(days=365)
+    hist = yf.download(ticker, start=one_year_ago.strftime('%Y-%m-%d'), end=today.strftime('%Y-%m-%d'), progress=False)
+
+    hist['daily_return'] = hist['Close'].pct_change()
+    hist['hv_1w'] = hist['daily_return'].rolling(window=5).std()
+    hist['hv_1m'] = hist['daily_return'].rolling(window=20).std()
+    hist['hv_rolling_1m'] = hist['daily_return'].rolling(window=20).std()
+
+    hv_year_low = hist['hv_rolling_1m'].min()
+    hv_year_high = hist['hv_rolling_1m'].max()
+    hv_current = hist['hv_rolling_1m'].iloc[-1]
+    hv_change_1w = hv_current - hist['hv_1w'].iloc[-6]  # 6 days back
+    hv_change_1m = hv_current - hist['hv_1m'].iloc[-21]  # 21 days back
+
+    options_df['hv_current'] = hv_current
+    options_df['hv_change_1w'] = hv_change_1w
+    options_df['hv_change_1m'] = hv_change_1m
+    options_df['hv_year_low'] = hv_year_low
+    options_df['hv_year_high'] = hv_year_high
+    options_df['hv_range_pct'] = (hv_current - hv_year_low) / (hv_year_high - hv_year_low + 1e-6)
+
+    return options_df
+
+historical_vol_df = None  # global cache
+
+def merge_historical_volatility(options_df, ticker, hist_csv_path="data/merged_war_comp.csv"):
+    global historical_vol_df
+    if historical_vol_df is None:
+        historical_vol_df = pd.read_csv(hist_csv_path, parse_dates=['date', 'expiration'])
+        historical_vol_df['call_put'] = historical_vol_df['call_put'].map({'Call': 'C', 'Put': 'P', 'Put': 'P', 'P': 'P', 'C': 'C'})
+        historical_vol_df['act_symbol'] = historical_vol_df['act_symbol'].str.upper()
+        historical_vol_df['merge_key'] = (
+            historical_vol_df['date'].dt.normalize().astype(str) + "_" +
+            historical_vol_df['act_symbol'] + "_" +
+            historical_vol_df['expiration'].astype(str) + "_" +
+            historical_vol_df['strike'].astype(str) + "_" +
+            historical_vol_df['call_put']
+        )
+
+    options_df['quote_date'] = pd.to_datetime(options_df['quote_date']).dt.normalize()
+    options_df['act_symbol'] = ticker.upper()
+    options_df['call_put'] = options_df['type'].str[0].str.upper()  # 'call' or 'put' → 'C' or 'P'
+    options_df['merge_key'] = (
+        options_df['quote_date'].astype(str) + "_" +
+        options_df['act_symbol'] + "_" +
+        options_df['expiration'].astype(str) + "_" +
+        options_df['strike'].astype(str) + "_" +
+        options_df['call_put']
+    )
+
+    merged = options_df.merge(
+        historical_vol_df.drop(columns=["stock_price", "bid", "ask", "delta", "gamma", "theta", "vega", "rho"], errors="ignore"),
+        how="left",
+        on="merge_key",
+        suffixes=('', '_hist')
+    )
+
+    return merged.drop(columns=["merge_key", "act_symbol", "call_put"])
+
 def prep_features(options_df, ticker):
     stock_price = get_single_stock_price(ticker)
     options_df['stock_price'] = stock_price
-    print("columns: ",options_df.columns)
     options_df['bid_ask_spread'] = options_df['ask'] - options_df['bid']
+    options_df['moneyness'] = options_df['stock_price'] / options_df['strike']
+    
+    # Pull IV from option chain if available
+    if 'impliedVolatility' in options_df.columns:
+        options_df['iv_current'] = options_df['impliedVolatility']
+    else:
+        options_df['iv_current'] = 0.3  # fallback
+
+    # Mock historical IV for now — future: fetch historical snapshots
+    options_df["iv_week_ago"] = options_df["iv_current"] * 0.95
+    options_df["iv_month_ago"] = options_df["iv_current"] * 0.9
+    options_df["iv_year_low"] = options_df["iv_current"] * 0.75
+    options_df["iv_year_high"] = options_df["iv_current"] * 1.25
+
+    options_df["iv_change_1w"] = options_df["iv_current"] - options_df["iv_week_ago"]
+    options_df["iv_change_1m"] = options_df["iv_current"] - options_df["iv_month_ago"]
+    options_df["iv_range_pct"] = (options_df["iv_current"] - options_df["iv_year_low"]) / (
+        options_df["iv_year_high"] - options_df["iv_year_low"] + 1e-6)
+
+    options_df = compute_volatility_features(options_df, ticker)
     options_df = add_spy_pct_5d(options_df)
-    print("🧪 Final columns in options_df:", options_df.columns)
-    print("📊 Sample of spy_pct_5d:", options_df.get("spy_pct_5d", "❌ Not Found").head())
 
     return options_df
+
+
+# def prep_features(options_df, ticker):
+#     stock_price = get_single_stock_price(ticker)
+#     options_df['stock_price'] = stock_price
+#     print("columns: ",options_df.columns)
+#     options_df['bid_ask_spread'] = options_df['ask'] - options_df['bid']
+#     options_df = add_spy_pct_5d(options_df)
+#     print("🧪 Final columns in options_df:", options_df.columns)
+#     print("📊 Sample of spy_pct_5d:", options_df.get("spy_pct_5d", "❌ Not Found").head())
+
+#     return options_df
     
 import yfinance as yf
 

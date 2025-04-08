@@ -5,16 +5,20 @@ from tensorflow.keras.models import load_model
 import fetch_options as fo
 
 # Load models
-clf_model_C = load_model("keras_clf_model_C.h5")
-clf_model_P = load_model("keras_clf_model_P.h5")
-reg_model_C = load_model("keras_reg_model_C.h5")
-reg_model_P = load_model("keras_reg_model_P.h5")
+clf_model_C = load_model("models/keras_clf_model_C.h5")
+clf_model_P = load_model("models/keras_clf_model_P.h5")
+reg_model_C = load_model("models/keras_reg_model_C.h5")
+reg_model_P = load_model("models/keras_reg_model_P.h5")
 
 # === Features used during training ===
 FEATURE_COLUMNS = [
-    "strike", "delta", "gamma", "theta", "vega", "rho",
-    "stock_price", "time_to_expiration", "bid_ask_spread", "spy_pct_5d"
+    "strike", "bid", "ask",
+    "delta", "gamma", "theta", "vega", "rho",
+    "iv_current", "iv_change_1w", "iv_change_1m", "iv_range_pct",
+    "hv_current", "hv_change_1w", "hv_change_1m", "hv_range_pct",
+    "time_to_expiration", "bid_ask_spread", "moneyness", "spy_pct_5d"
 ]
+
 
 def predict_profitability(options_df):
     scaler = StandardScaler()
@@ -34,6 +38,9 @@ def predict_profitability(options_df):
     # Now scale
     X_scaled = scaler.fit_transform(X)
 
+    # Prediction value filter
+    MIN_PROB = 0.85
+
     for features, (_, row) in zip(X_scaled, options_df.iterrows()):
         features = features.reshape(1, -1)
         opt_type = row['type'].upper()
@@ -41,14 +48,14 @@ def predict_profitability(options_df):
         if opt_type == 'CALL' or opt_type == 'C':
             clf_pred = clf_model_C.predict(features, verbose=0)[0][0]
             print("  🔎 clf_pred prob:", clf_pred)
-            if clf_pred < 0.7:
+            if clf_pred < MIN_PROB:
                 predictions.append((0, 0))
                 continue
             reg_pred = reg_model_C.predict(features, verbose=0)[0][0]
             predictions.append((1, reg_pred))
         elif opt_type == 'PUT' or opt_type == 'P':
             clf_pred = clf_model_P.predict(features, verbose=0)[0][0]
-            if clf_pred < 0.7:
+            if clf_pred < MIN_PROB:
                 predictions.append((0, 0))
                 continue
             reg_pred = reg_model_P.predict(features, verbose=0)[0][0]
